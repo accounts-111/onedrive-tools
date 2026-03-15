@@ -341,6 +341,7 @@ class OneDriveTools:
 
                 item_path = f"{parent_path.rstrip('/')}/{item['name']}"
 
+                hashes = item.get("file", {}).get("hashes", {})
                 all_files.append({
                     "id": item["id"],
                     "name": item["name"],
@@ -350,6 +351,9 @@ class OneDriveTools:
                     "lastModified": item.get("lastModifiedDateTime", ""),
                     "mimeType": item.get("file", {}).get("mimeType", ""),
                     "webUrl": item.get("webUrl", ""),
+                    "sha1": hashes.get("sha1Hash", ""),
+                    "sha256": hashes.get("sha256Hash", ""),
+                    "quickXorHash": hashes.get("quickXorHash", ""),
                 })
 
             if len(all_files) > 0 and page % 2 == 0:
@@ -524,6 +528,10 @@ class OneDriveTools:
     def get_hashes(self, folder_path, recursive=True):
         """Get SHA1/SHA256/quickXorHash from file metadata (no download needed).
 
+        When using recursive mode, hashes come from the delta query response
+        directly — no extra API calls needed. Non-recursive mode fetches
+        hashes per-file.
+
         Args:
             folder_path: OneDrive folder path.
             recursive: Recurse into subfolders.
@@ -535,21 +543,36 @@ class OneDriveTools:
         self._require_token()
         print(f"[hashes] Listing files in '{folder_path}'...")
         files = self.list_files(folder_path, recursive=recursive)
-        print(f"[hashes] Fetching hashes for {len(files)} files...")
 
-        results = []
-        completed = 0
-        start_time = time.time()
+        # Check if hashes already came from delta query
+        has_hashes = files and files[0].get("sha256") is not None
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(self._extract_hashes, f): f for f in files
-            }
-            for future in as_completed(futures):
-                completed += 1
-                result = future.result()
-                results.append(result)
-                self._progress(completed, len(files), start_time)
+        if has_hashes:
+            print(f"[hashes] Hashes included from listing ({len(files)} files)")
+            results = [{
+                "filename": f["name"],
+                "folder": f["folder"],
+                "path": f["path"],
+                "sha1": f.get("sha1", ""),
+                "sha256": f.get("sha256", ""),
+                "quickXorHash": f.get("quickXorHash", ""),
+                "size": f["size"],
+            } for f in files]
+        else:
+            print(f"[hashes] Fetching hashes for {len(files)} files...")
+            results = []
+            completed = 0
+            start_time = time.time()
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(self._extract_hashes, f): f for f in files
+                }
+                for future in as_completed(futures):
+                    completed += 1
+                    result = future.result()
+                    results.append(result)
+                    self._progress(completed, len(files), start_time)
 
         # Write CSV
         csv_path = self._output_path("hashes", folder_path=folder_path)
