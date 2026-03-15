@@ -139,26 +139,66 @@ class OneDriveTools:
         return self.output_dir / f"{prefix}_{timestamp}.{ext}"
 
     # ─────────────────────────────────────────────
-    # HTTP helpers
+    # HTTP helpers (with retry and rate limiting)
     # ─────────────────────────────────────────────
+
+    _last_request_time = 0
+    _min_request_interval = 0.05  # 50ms between requests (max ~20/sec)
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _get(self, url, params=None):
-        resp = requests.get(url, headers=self._headers(), params=params)
+    def _throttle(self):
+        """Enforce minimum interval between API requests."""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_request_interval:
+            time.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = time.time()
+
+    def _request_with_retry(self, method, url, max_retries=5, **kwargs):
+        """Make an HTTP request with exponential backoff retry.
+
+        Retries on 429 (throttled), 503 (service unavailable), 504 (gateway timeout),
+        and connection errors.
+        """
+        for attempt in range(max_retries + 1):
+            self._throttle()
+            try:
+                resp = method(url, **kwargs)
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"  [throttled] Retry-After {retry_after}s (attempt {attempt + 1}/{max_retries + 1})", flush=True)
+                    time.sleep(retry_after)
+                    continue
+                if resp.status_code in (503, 504) and attempt < max_retries:
+                    wait = 2 ** attempt
+                    print(f"  [retry] {resp.status_code} — waiting {wait}s (attempt {attempt + 1}/{max_retries + 1})", flush=True)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    print(f"  [connection error] {e.__class__.__name__} — waiting {wait}s (attempt {attempt + 1}/{max_retries + 1})", flush=True)
+                    time.sleep(wait)
+                    continue
+                raise
         resp.raise_for_status()
+        return resp
+
+    def _get(self, url, params=None):
+        resp = self._request_with_retry(requests.get, url, headers=self._headers(), params=params)
         return resp.json()
 
     def _post(self, url, json_body):
         headers = {**self._headers(), "Content-Type": "application/json"}
-        resp = requests.post(url, headers=headers, json=json_body)
-        resp.raise_for_status()
+        resp = self._request_with_retry(requests.post, url, headers=headers, json=json_body)
         return resp.json()
 
     def _delete(self, url):
-        resp = requests.delete(url, headers=self._headers())
-        resp.raise_for_status()
+        self._request_with_retry(requests.delete, url, headers=self._headers())
 
     def _item_url(self, file_path):
         """Build Graph API URL for an item by path."""
@@ -231,6 +271,10 @@ class OneDriveTools:
     def list_files(self, folder_path, recursive=True):
         """List files with metadata in a OneDrive folder.
 
+        Uses delta query for recursive listing (much faster — single paginated
+        request instead of one API call per subfolder). Falls back to children
+        API for non-recursive listing.
+
         Args:
             folder_path: OneDrive path (e.g. "/Documents"). Use "/" or None for root.
             recursive: If True, recurse into subfolders.
@@ -241,23 +285,91 @@ class OneDriveTools:
         """
         self._require_token()
         folder_path = folder_path or "/"
-        url = self._children_url(folder_path)
+
+        if not recursive:
+            # Non-recursive: use children API (single folder)
+            url = self._children_url(folder_path)
+            all_files = []
+            self._list_children(url, folder_path, all_files)
+            return all_files
+
+        # Recursive: use delta query for efficiency
+        return self._list_via_delta(folder_path)
+
+    def _list_via_delta(self, folder_path):
+        """List all files recursively using delta query.
+
+        Delta query returns all items in the drive in a flat list,
+        paginated. We filter to the target folder prefix.
+        """
+        folder_path = folder_path or "/"
+        folder_prefix = folder_path.rstrip("/") if folder_path != "/" else ""
+
+        # Get the folder's item ID to scope the delta query
+        if folder_path == "/":
+            delta_url = f"{GRAPH_BASE}/me/drive/root/delta"
+        else:
+            path = folder_path.strip("/")
+            item = self._get(f"{GRAPH_BASE}/me/drive/root:/{path}")
+            item_id = item["id"]
+            delta_url = f"{GRAPH_BASE}/me/drive/items/{item_id}/delta"
+
         all_files = []
-        self._list_recursive(url, folder_path, all_files, recursive)
+        page = 0
+        while delta_url:
+            page += 1
+            data = self._get(delta_url)
+            for item in data.get("value", []):
+                # Skip folders and deleted items
+                if "folder" in item or item.get("deleted"):
+                    continue
+                if "file" not in item:
+                    continue
+
+                # Build path from parentReference
+                parent = item.get("parentReference", {})
+                parent_path = parent.get("path", "")
+                # Strip /drive/root: prefix
+                if ":/drive/root:" in parent_path:
+                    parent_path = parent_path.split(":/drive/root:")[-1]
+                elif parent_path.startswith("/drive/root:"):
+                    parent_path = parent_path[len("/drive/root:"):]
+                elif parent_path.startswith("/drive/root"):
+                    parent_path = parent_path[len("/drive/root"):]
+                if not parent_path:
+                    parent_path = "/"
+
+                item_path = f"{parent_path.rstrip('/')}/{item['name']}"
+
+                all_files.append({
+                    "id": item["id"],
+                    "name": item["name"],
+                    "path": item_path,
+                    "folder": parent_path,
+                    "size": item.get("size", 0),
+                    "lastModified": item.get("lastModifiedDateTime", ""),
+                    "mimeType": item.get("file", {}).get("mimeType", ""),
+                    "webUrl": item.get("webUrl", ""),
+                })
+
+            if len(all_files) > 0 and page % 2 == 0:
+                print(f"  ... {len(all_files)} files found ({page} pages fetched)", flush=True)
+
+            # Follow pagination (nextLink), stop at deltaLink
+            delta_url = data.get("@odata.nextLink")
+            if not delta_url:
+                break  # deltaLink means we've got everything
+
+        print(f"  ... {len(all_files)} files total ({page} pages)", flush=True)
         return all_files
 
-    def _list_recursive(self, url, current_path, all_files, recursive):
-        """Helper for recursive file listing with pagination."""
+    def _list_children(self, url, current_path, all_files):
+        """List immediate children (files only) with pagination."""
         while url:
             data = self._get(url)
             for item in data.get("value", []):
-                item_path = f"{current_path.rstrip('/')}/{item['name']}"
-                if "folder" in item:
-                    if recursive:
-                        print(f"  Scanning: {item_path}/ ...", flush=True)
-                        child_url = f"{GRAPH_BASE}/me/drive/items/{item['id']}/children"
-                        self._list_recursive(child_url, item_path, all_files, True)
-                elif "file" in item:
+                if "file" in item:
+                    item_path = f"{current_path.rstrip('/')}/{item['name']}"
                     all_files.append({
                         "id": item["id"],
                         "name": item["name"],
@@ -268,8 +380,6 @@ class OneDriveTools:
                         "mimeType": item.get("file", {}).get("mimeType", ""),
                         "webUrl": item.get("webUrl", ""),
                     })
-                    if len(all_files) % 100 == 0:
-                        print(f"  ... {len(all_files)} files found so far", flush=True)
             url = data.get("@odata.nextLink")
 
     def search(self, query, folder_path=None):
