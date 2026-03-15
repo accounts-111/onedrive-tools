@@ -1,0 +1,7 @@
+output/
+onedrive_audit.csv
+onedrive_audit.md
+onedrive_links.py
+__pycache__/
+*.pyc
+.DS_Store
